@@ -1,0 +1,17 @@
+# Core MCP Server Dependencies
+mcp>=1.0.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+
+# AWS and Observability
+boto3>=1.28.0
+aws-opentelemetry-distro>=0.10.1
+
+# Utilities
+pyyaml>=6.0
+python-dotenv>=1.0.0
+httpx>=0.24.0
+
+# Validation and Security
+jsonschema>=4.0.0
