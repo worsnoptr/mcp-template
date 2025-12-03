@@ -1,0 +1,11 @@
+# Optional dependencies for OpenAPI Specification Mode
+# Install with: pip install -r requirements-openapi.txt
+
+# Includes all core dependencies
+-r requirements.txt
+
+# OpenAPI specific dependencies
+openapi-spec-validator>=0.7.0
+prance>=23.0.0
+openapi-core>=0.18.0
+requests>=2.31.0

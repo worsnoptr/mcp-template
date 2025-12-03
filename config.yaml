@@ -1,0 +1,96 @@
+# MCP Server Configuration Template
+# Customize these values for your specific deployment
+
+server:
+  # Server host (0.0.0.0 required by AgentCore)
+  host: "0.0.0.0"
+  # Server port (8000 required by AgentCore)
+  port: 8000
+  # MCP endpoint path (required by AgentCore)
+  mcp_path: "/mcp"
+  # Enable stateless HTTP (required by AgentCore)
+  stateless_http: true
+
+mcp:
+  # MCP protocol version
+  protocol_version: "2024-11-05"
+  # Server name and version (customize for your server)
+  server_name: "my-mcp-server"
+  server_version: "1.0.0"
+
+tools:
+  # Mode: "direct" or "openapi" or "both"
+  mode: "direct"
+  
+  # Direct mode configuration
+  direct:
+    # List of tool modules to load
+    modules:
+      - "tools.direct_tools"
+      - "examples.calculator_tools"
+  
+  # OpenAPI mode configuration
+  openapi:
+    # Path to OpenAPI specification file(s)
+    specs:
+      - "examples/sample_openapi.yaml"
+    # Base URL for API calls (if different from spec)
+    base_url: null
+    # Authentication configuration for API calls
+    auth:
+      type: null  # Options: "bearer", "api_key", "basic", null
+      header: null  # Header name for auth token
+
+observability:
+  # Enable AWS Distro for OpenTelemetry (ADOT)
+  enabled: true
+  # Service name for traces
+  service_name: "mcp-server"
+  # CloudWatch log group
+  log_group: "/aws/agentcore/mcp-server"
+  # Trace sampling rate (0.0 to 1.0)
+  sampling_rate: 1.0
+
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  # Log format
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  # Include request IDs in logs
+  include_request_id: true
+
+security:
+  # Enable request validation
+  validate_inputs: true
+  # Maximum request size (bytes)
+  max_request_size: 1048576  # 1MB
+  # Rate limiting (requests per minute)
+  rate_limit: 60
+  # Allowed origins for CORS (null = disabled)
+  cors_origins: null
+
+error_handling:
+  # Include stack traces in error responses (disable in production)
+  include_stack_trace: false
+  # Custom error messages
+  messages:
+    validation_error: "Invalid input parameters"
+    tool_not_found: "Requested tool not found"
+    internal_error: "An internal error occurred"
+
+# Environment-specific overrides
+# These will override the above settings when the environment matches
+environments:
+  development:
+    logging:
+      level: "DEBUG"
+    error_handling:
+      include_stack_trace: true
+  
+  production:
+    logging:
+      level: "WARNING"
+    error_handling:
+      include_stack_trace: false
+    security:
+      rate_limit: 100
