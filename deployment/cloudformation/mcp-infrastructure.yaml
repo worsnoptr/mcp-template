@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for MCP Server deployment to AgentCore Runtime'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mcp-server
+    Description: Project name used for resource naming
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+  
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+  
+  EnableOAuth:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable OAuth authentication for MCP server
+  
+  OAuthDiscoveryUrl:
+    Type: String
+    Default: ''
+    Description: OAuth discovery URL (required if EnableOAuth is true)
+  
+  OAuthClientId:
+    Type: String
+    Default: ''
+    Description: OAuth client ID (required if EnableOAuth is true)
+  
+  DeploymentMethod:
+    Type: String
+    Default: s3
+    AllowedValues:
+      - s3
+      - docker
+    Description: Deployment method (S3 direct or Docker)
+
+Conditions:
+  UseOAuth: !Equals [!Ref EnableOAuth, 'true']
+  UseS3Deployment: !Equals [!Ref DeploymentMethod, 's3']
+  UseDockerDeployment: !Equals [!Ref DeploymentMethod, 'docker']
+
+Resources:
+  # S3 Bucket for deployment packages
+  DeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-deployments-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteOldDeployments
+            Status: Enabled
+            ExpirationInDays: 90
+            Prefix: mcp-server/
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-deployments'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ECR Repository for Docker images (if using Docker deployment)
+  ContainerRepository:
+    Type: AWS::ECR::Repository
+    Condition: UseDockerDeployment
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-${Environment}'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecr'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for AgentCore Runtime execution
+  AgentCoreExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-agentcore-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock-agentcore.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: S3DeploymentAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DeploymentBucket.Arn
+                  - !Sub '${DeploymentBucket.Arn}/*'
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/${Environment}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-agentcore-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for AgentCore Runtime
+  AgentCoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock-agentcore/${ProjectName}-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for deployment notifications
+  DeploymentNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-deployments'
+      DisplayName: MCP Server Deployment Notifications
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for AgentCore errors
+  AgentCoreErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-errors'
+      AlarmDescription: Alert when AgentCore runtime has errors
+      MetricName: Errors
+      Namespace: AWS/BedrockAgentCore
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DeploymentNotificationTopic
+      Dimensions:
+        - Name: RuntimeName
+          Value: !Sub '${ProjectName}-${Environment}'
+
+  # Parameter Store entries for configuration
+  RuntimeArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/runtime-arn'
+      Type: String
+      Value: 'pending-deployment'
+      Description: AgentCore Runtime ARN (updated after deployment)
+      Tags:
+        Environment: !Ref Environment
+
+  DeploymentBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/deployment-bucket'
+      Type: String
+      Value: !Ref DeploymentBucket
+      Description: S3 bucket for deployment packages
+      Tags:
+        Environment: !Ref Environment
+
+  ExecutionRoleArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/execution-role-arn'
+      Type: String
+      Value: !GetAtt AgentCoreExecutionRole.Arn
+      Description: IAM execution role ARN for AgentCore
+      Tags:
+        Environment: !Ref Environment
+
+Outputs:
+  DeploymentBucket:
+    Description: S3 bucket for deployment packages
+    Value: !Ref DeploymentBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-deployment-bucket'
+
+  DeploymentBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt DeploymentBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-deployment-bucket-arn'
+
+  ContainerRepositoryUri:
+    Description: ECR repository URI for Docker images
+    Condition: UseDockerDeployment
+    Value: !GetAtt ContainerRepository.RepositoryUri
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecr-uri'
+
+  ExecutionRoleArn:
+    Description: IAM execution role ARN for AgentCore Runtime
+    Value: !GetAtt AgentCoreExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-execution-role-arn'
+
+  LogGroupName:
+    Description: CloudWatch log group for AgentCore Runtime
+    Value: !Ref AgentCoreLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-log-group'
+
+  NotificationTopicArn:
+    Description: SNS topic for deployment notifications
+    Value: !Ref DeploymentNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-notification-topic'
+
+  DeploymentCommand:
+    Description: Example deployment command
+    Value: !Sub |
+      # For S3 deployment:
+      python deployment/s3-direct/deploy_s3.py \
+        --bucket ${DeploymentBucket} \
+        --role-arn ${AgentCoreExecutionRole.Arn} \
+        --runtime-name ${ProjectName}-${Environment} \
+        --region ${AWS::Region}
