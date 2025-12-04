@@ -1,20 +1,38 @@
 #!/usr/bin/env python3
 """
-Remote MCP Server Test Client
+Remote MCP Server Test Client - OAuth Authentication
 
-This script tests a deployed MCP server on Amazon Bedrock AgentCore Runtime.
+This script tests a deployed MCP server on Amazon Bedrock AgentCore Runtime using OAuth authentication.
+
+AUTHENTICATION OPTIONS:
+
+1. OAuth Authentication (This Script):
+   - Requires a valid OAuth bearer token from your identity provider
+   - Suitable for user-based authentication
+   - Token must be obtained from Cognito, Auth0, or other OAuth provider
+   
+   Usage:
+       export AGENT_ARN="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server-xyz"
+       export BEARER_TOKEN="your-oauth-token"
+       python tests/test_client_remote.py
+
+2. IAM Authentication (Recommended for AWS Environments):
+   - Uses AWS credentials (no separate token required)
+   - Works seamlessly with AWS CLI, SDK, or IAM roles
+   - See tests/test_client_remote_iam.py for IAM-based testing
+   
+   Usage:
+       export AGENT_ARN="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server-xyz"
+       python tests/test_client_remote_iam.py
 
 Prerequisites:
 - Agent deployed to AgentCore Runtime
-- Valid OAuth token or AWS credentials
+- Valid OAuth token (for this script) OR AWS credentials (for IAM script)
+- MCP Python SDK: pip install mcp
 
-Usage:
-    # Set environment variables
-    export AGENT_ARN="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server-xyz"
-    export BEARER_TOKEN="your-oauth-token"  # If using OAuth
-    
-    # Run the test
-    python tests/test_client_remote.py
+Note: This script uses the MCP SDK's streamablehttp_client which handles HTTP connections.
+For IAM authentication with boto3, see test_client_remote_iam.py which demonstrates the 
+critical accept header requirement and SSE response parsing.
 """
 
 import asyncio

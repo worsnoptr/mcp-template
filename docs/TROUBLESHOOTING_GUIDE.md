@@ -328,6 +328,332 @@ arguments = {"A": 42}  # ❌ Wrong case
 arguments = {"a": "42"}  # ❌ Wrong type (string instead of number)
 ```
 
+## MCP Invocation Errors
+
+### Issue: HTTP 406 Not Acceptable
+
+**Error:**
+```
+botocore.exceptions.ClientError: An error occurred (406) when calling the InvokeAgentRuntime operation: Not Acceptable
+```
+
+**Cause:**
+
+This error occurs when the `accept` header in your `invoke_agent_runtime` call is missing or incorrect. The AgentCore runtime returns responses in **Server-Sent Events (SSE)** format, which requires `text/event-stream` in the accept header.
+
+**Common mistakes:**
+```python
+# ❌ Wrong: Only application/json
+response = client.invoke_agent_runtime(
+    ...,
+    accept='application/json'  # Missing text/event-stream
+)
+
+# ❌ Wrong: No accept parameter (defaults to application/json)
+response = client.invoke_agent_runtime(
+    agentRuntimeArn=runtime_arn,
+    runtimeSessionId=session_id,
+    payload=payload
+    # Missing accept parameter
+)
+```
+
+**Solution:**
+
+Always include `text/event-stream` in the accept header:
+
+```python
+import boto3
+import json
+import uuid
+
+client = boto3.client('bedrock-agentcore-runtime', region_name='us-west-2')
+
+# Generate unique session ID (33+ characters required)
+session_id = f"my-session-{uuid.uuid4().hex}"
+
+payload = {
+    "jsonrpc": "2.0",
+    "method": "tools/list",
+    "id": 1
+}
+
+# ✓ Correct: Include both application/json and text/event-stream
+response = client.invoke_agent_runtime(
+    agentRuntimeArn='arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server',
+    runtimeSessionId=session_id,
+    mcpSessionId=session_id,
+    mcpProtocolVersion='2024-11-05',
+    payload=json.dumps(payload),
+    qualifier='DEFAULT',
+    accept='application/json, text/event-stream'  # ✓ CRITICAL: Include text/event-stream
+)
+```
+
+**Why is this required?**
+
+AgentCore returns responses in SSE format, which is a streaming text format. The response looks like:
+
+```
+data: {"jsonrpc":"2.0","result":{...},"id":1}
+
+data: {"jsonrpc":"2.0","result":{...},"id":2}
+```
+
+Without `text/event-stream` in the accept header, the server cannot provide the response in a format you're willing to accept, resulting in HTTP 406.
+
+### Parsing SSE Responses
+
+After fixing the accept header, you must parse the SSE format:
+
+**Complete working example:**
+
+```python
+def parse_sse_response(response_body):
+    """
+    Parse Server-Sent Events (SSE) response from AgentCore.
+    
+    Args:
+        response_body: Bytes from response['response'].read()
+    
+    Returns:
+        Parsed JSON data (single object or list of objects)
+    """
+    results = []
+    
+    # Decode bytes to UTF-8 string
+    response_text = response_body.decode('utf-8')
+    
+    # Split by newlines and process each line
+    for line in response_text.strip().split('\n'):
+        # SSE data lines start with 'data: '
+        if line.startswith('data: '):
+            # Extract JSON after 'data: ' prefix (6 characters)
+            json_str = line[6:]
+            
+            try:
+                data = json.loads(json_str)
+                results.append(data)
+            except json.JSONDecodeError as e:
+                print(f"Warning: Failed to parse JSON: {e}")
+                continue
+    
+    # Return single result or list of results
+    if len(results) == 1:
+        return results[0]
+    return results
+
+# Usage
+response_body = response['response'].read()
+result = parse_sse_response(response_body)
+
+# Now you can work with the parsed result
+if 'result' in result:
+    tools = result['result']['tools']
+    print(f"Found {len(tools)} tools")
+elif 'error' in result:
+    print(f"Error: {result['error']}")
+```
+
+**Complete invocation example with error handling:**
+
+```python
+import boto3
+import json
+import uuid
+from botocore.exceptions import ClientError
+
+def invoke_mcp_tool(runtime_arn, tool_name, arguments, region='us-west-2'):
+    """
+    Invoke an MCP tool with proper error handling.
+    
+    Args:
+        runtime_arn: Full ARN of the AgentCore runtime
+        tool_name: Name of the tool to call
+        arguments: Dictionary of tool arguments
+        region: AWS region
+    
+    Returns:
+        Tool execution result
+    """
+    client = boto3.client('bedrock-agentcore-runtime', region_name=region)
+    
+    # Generate unique session ID (must be 33+ characters)
+    session_id = f"tool-invocation-{uuid.uuid4().hex}"
+    
+    # Prepare JSON-RPC payload
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments
+        },
+        "id": 1
+    }
+    
+    try:
+        # Invoke with correct accept header
+        response = client.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            runtimeSessionId=session_id,
+            mcpSessionId=session_id,
+            mcpProtocolVersion='2024-11-05',
+            payload=json.dumps(payload),
+            qualifier='DEFAULT',
+            accept='application/json, text/event-stream'  # CRITICAL
+        )
+        
+        # Parse SSE response
+        response_body = response['response'].read()
+        result = parse_sse_response(response_body)
+        
+        # Check for JSON-RPC errors
+        if 'error' in result:
+            raise Exception(f"JSON-RPC Error: {result['error']}")
+        
+        return result['result']
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        http_status = e.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+        
+        if http_status == 406:
+            raise Exception(
+                "HTTP 406 Not Acceptable: Missing 'text/event-stream' in accept header. "
+                "Ensure: accept='application/json, text/event-stream'"
+            )
+        elif error_code == 'AccessDeniedException':
+            raise Exception(
+                f"Access Denied: Ensure IAM policy includes "
+                f"bedrock-agentcore:InvokeAgentRuntime for {runtime_arn}"
+            )
+        else:
+            raise
+
+# Example usage
+try:
+    result = invoke_mcp_tool(
+        runtime_arn='arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server',
+        tool_name='add_numbers',
+        arguments={'a': 5, 'b': 3}
+    )
+    print(f"Result: {result}")
+except Exception as e:
+    print(f"Error: {e}")
+```
+
+### Issue: HTTP 403 Forbidden (IAM Authentication)
+
+**Error:**
+```
+botocore.exceptions.ClientError: An error occurred (AccessDeniedException) when calling the InvokeAgentRuntime operation: User is not authorized to perform: bedrock-agentcore:InvokeAgentRuntime on resource: arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server
+```
+
+**Diagnosis:**
+
+Check your current IAM identity:
+```bash
+# See who you are
+aws sts get-caller-identity
+
+# Check if you can invoke
+aws bedrock-agentcore-runtime invoke-agent-runtime \
+  --agent-runtime-arn arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server \
+  --runtime-session-id "test-$(uuidgen)" \
+  --mcp-session-id "test-$(uuidgen)" \
+  --mcp-protocol-version "2024-11-05" \
+  --payload '{"jsonrpc":"2.0","method":"tools/list","id":1}' \
+  --accept "application/json, text/event-stream"
+```
+
+**Solution 1: Add IAM Policy to User/Role**
+
+Attach this policy to your IAM user or role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowMCPInvocation",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:InvokeAgentRuntime"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server"
+    }
+  ]
+}
+```
+
+For multiple runtimes or all runtimes:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:InvokeAgentRuntime"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:*:*:runtime/*"
+    }
+  ]
+}
+```
+
+**Solution 2: Verify Runtime ARN**
+
+```python
+import boto3
+
+# List all runtimes to find correct ARN
+client = boto3.client('bedrock-agentcore-control', region_name='us-west-2')
+
+response = client.list_agent_runtimes()
+for runtime in response['agentRuntimes']:
+    print(f"Name: {runtime['agentRuntimeName']}")
+    print(f"ARN: {runtime['agentRuntimeArn']}")
+    print(f"Status: {runtime['status']}")
+    print("---")
+```
+
+**Solution 3: Use Correct AWS Profile**
+
+```bash
+# If using named profiles
+export AWS_PROFILE=my-profile
+
+# Verify credentials
+aws sts get-caller-identity --profile my-profile
+
+# Run script with profile
+AWS_PROFILE=my-profile python tests/test_client_remote_iam.py
+```
+
+### Complete Test Script
+
+For a production-ready example with all error handling, see:
+```bash
+tests/test_client_remote_iam.py
+```
+
+This script includes:
+- ✅ Correct accept header with text/event-stream
+- ✅ SSE response parsing
+- ✅ AWS credential verification
+- ✅ Proper session ID generation (33+ chars)
+- ✅ JSON-RPC error handling
+- ✅ HTTP 406 and 403 error messages
+- ✅ Multiple test cases
+
+Run it:
+```bash
+export AGENT_ARN="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server"
+python tests/test_client_remote_iam.py
+```
+
 ## Runtime Issues
 
 ### Issue: Runtime Stuck in CREATING Status
