@@ -281,7 +281,7 @@ Create `invoke.py`:
 import boto3
 import json
 
-client = boto3.client('bedrock-agentcore', region_name='us-west-2')
+client = boto3.client('bedrock-agentcore-runtime', region_name='us-west-2')
 
 payload = json.dumps({
     "jsonrpc": "2.0",
@@ -303,6 +303,217 @@ print(json.loads(response_body))
 Run:
 ```bash
 python invoke.py
+```
+
+## Invoking with IAM Authentication (boto3)
+
+IAM authentication is the recommended approach for invoking MCP servers from AWS environments. It uses your AWS credentials without requiring separate OAuth tokens.
+
+### Complete Working Example
+
+```python
+#!/usr/bin/env python3
+"""
+Invoke MCP server using IAM authentication with boto3.
+"""
+import boto3
+import json
+import uuid
+
+def parse_sse_response(response_body):
+    """
+    Parse Server-Sent Events (SSE) response.
+    
+    SSE format:
+        data: {"jsonrpc":"2.0","result":{...},"id":1}
+        
+    Each line starting with 'data: ' contains JSON.
+    """
+    results = []
+    response_text = response_body.decode('utf-8')
+    
+    for line in response_text.strip().split('\n'):
+        if line.startswith('data: '):
+            json_str = line[6:]  # Remove 'data: ' prefix
+            results.append(json.loads(json_str))
+    
+    return results[0] if len(results) == 1 else results
+
+# Initialize boto3 client
+client = boto3.client('bedrock-agentcore-runtime', region_name='us-west-2')
+
+# Generate unique session ID (must be 33+ characters)
+session_id = f"my-app-session-{uuid.uuid4().hex}"
+
+# Prepare JSON-RPC payload
+payload = {
+    "jsonrpc": "2.0",
+    "method": "tools/list",
+    "id": 1
+}
+
+# CRITICAL: Invoke with correct accept header
+response = client.invoke_agent_runtime(
+    agentRuntimeArn='arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server',
+    runtimeSessionId=session_id,
+    mcpSessionId=session_id,  # Use same ID for MCP session
+    mcpProtocolVersion='2024-11-05',  # Required protocol version
+    payload=json.dumps(payload),
+    qualifier='DEFAULT',
+    accept='application/json, text/event-stream'  # CRITICAL: Must include text/event-stream
+)
+
+# Parse SSE response
+response_body = response['response'].read()
+result = parse_sse_response(response_body)
+
+print(json.dumps(result, indent=2))
+```
+
+### Key Parameters
+
+| Parameter | Required | Description | Example |
+|-----------|----------|-------------|---------|
+| `agentRuntimeArn` | Yes | Full ARN of deployed runtime | `arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server` |
+| `runtimeSessionId` | Yes | Unique session identifier (33+ chars) | `my-app-session-abc123...` (use UUID) |
+| `mcpSessionId` | Yes | MCP protocol session ID (33+ chars) | Same as runtimeSessionId or separate UUID |
+| `mcpProtocolVersion` | Yes | MCP protocol version | `2024-11-05` |
+| `payload` | Yes | JSON-RPC request as string | `json.dumps({"jsonrpc": "2.0", ...})` |
+| `qualifier` | Yes | Runtime version/alias | `DEFAULT` or version ARN |
+| `accept` | **CRITICAL** | Response format | `application/json, text/event-stream` |
+
+### Understanding the Accept Header
+
+**Why is this critical?**
+
+The AgentCore runtime returns responses in **Server-Sent Events (SSE)** format, which is a streaming text format. If you only specify `application/json`, the server returns HTTP 406 Not Acceptable because it cannot provide a plain JSON response.
+
+**Correct:**
+```python
+accept='application/json, text/event-stream'  # ✓ Works
+```
+
+**Incorrect:**
+```python
+accept='application/json'  # ✗ HTTP 406 error
+# OR
+# Not specifying accept parameter  # ✗ HTTP 406 error
+```
+
+### SSE Response Parsing
+
+The response body contains Server-Sent Events formatted as:
+
+```
+data: {"jsonrpc":"2.0","result":{"tools":[...]},"id":1}
+
+data: {"jsonrpc":"2.0","result":{...},"id":2}
+```
+
+**Parsing logic:**
+
+```python
+def parse_sse_response(response_body):
+    """Parse SSE format response."""
+    results = []
+    
+    # Decode bytes to string
+    response_text = response_body.decode('utf-8')
+    
+    # Process each line
+    for line in response_text.strip().split('\n'):
+        # SSE data lines start with 'data: '
+        if line.startswith('data: '):
+            # Extract JSON after the prefix
+            json_str = line[6:]  # Remove 'data: ' (6 characters)
+            
+            try:
+                data = json.loads(json_str)
+                results.append(data)
+            except json.JSONDecodeError:
+                # Handle malformed JSON
+                continue
+    
+    # Return single result or list of results
+    return results[0] if len(results) == 1 else results
+```
+
+### Common Errors and Solutions
+
+#### HTTP 406 Not Acceptable
+
+**Error:**
+```
+botocore.exceptions.ClientError: An error occurred (406) when calling the InvokeAgentRuntime operation: Not Acceptable
+```
+
+**Cause:** Missing `text/event-stream` in accept header.
+
+**Solution:**
+```python
+# Add text/event-stream to accept parameter
+response = client.invoke_agent_runtime(
+    ...,
+    accept='application/json, text/event-stream'  # Add this
+)
+```
+
+#### HTTP 403 Forbidden
+
+**Error:**
+```
+botocore.exceptions.ClientError: An error occurred (AccessDeniedException) when calling the InvokeAgentRuntime operation: User is not authorized to perform: bedrock-agentcore:InvokeAgentRuntime
+```
+
+**Cause:** Missing IAM permissions.
+
+**Solution:** Add permission to your IAM user/role:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:InvokeAgentRuntime"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/*"
+    }
+  ]
+}
+```
+
+#### Session ID Too Short
+
+**Error:**
+```
+ValidationException: runtimeSessionId must be at least 33 characters
+```
+
+**Solution:** Generate longer session IDs:
+```python
+import uuid
+
+# Correct (49 characters)
+session_id = f"my-app-session-{uuid.uuid4().hex}"
+
+# Wrong (11 characters)
+session_id = "session-123"  # Too short
+```
+
+### Complete Test Script
+
+See `tests/test_client_remote_iam.py` for a production-ready example with:
+- Proper error handling
+- AWS credential verification
+- SSE response parsing
+- Multiple test cases
+- Detailed logging
+
+Run it with:
+```bash
+export AGENT_ARN="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server"
+python tests/test_client_remote_iam.py
 ```
 
 ## Configuration Options

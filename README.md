@@ -260,7 +260,7 @@ This will:
 3. Deploy to Amazon Bedrock AgentCore Runtime
 4. Return your agent runtime ARN
 
-### Step 3: Test Remote Deployment
+### Step 3: Test Remote Deployment (OAuth Authentication)
 
 ```bash
 # Set environment variables
@@ -270,6 +270,50 @@ export BEARER_TOKEN="your-oauth-token"
 # Run remote test
 python tests/test_client_remote.py
 ```
+
+### Test Remote Deployment (IAM Authentication)
+
+For AWS environments, IAM authentication is often simpler and more secure than OAuth:
+
+```bash
+# Set the agent runtime ARN
+export AGENT_ARN="your-agent-runtime-arn"
+
+# Run IAM authentication test (uses AWS credentials automatically)
+python tests/test_client_remote_iam.py
+```
+
+**Critical Requirement**: When using IAM authentication with boto3's `invoke_agent_runtime`, you **MUST** include `text/event-stream` in the accept header:
+
+```python
+response = client.invoke_agent_runtime(
+    agentRuntimeArn=runtime_arn,
+    runtimeSessionId=session_id,
+    mcpSessionId=session_id,
+    mcpProtocolVersion='2024-11-05',
+    payload=payload,
+    qualifier='DEFAULT',
+    accept='application/json, text/event-stream'  # CRITICAL: Include text/event-stream
+)
+```
+
+**Common Error**: Using only `accept='application/json'` will cause **HTTP 406 Not Acceptable** errors. The AgentCore runtime returns responses in Server-Sent Events (SSE) format, which requires `text/event-stream` in the accept header.
+
+**Response Parsing**: The response is in SSE format and must be parsed accordingly:
+
+```python
+# Read the response stream
+response_body = response['response'].read()
+response_text = response_body.decode('utf-8')
+
+# Parse SSE format (lines starting with 'data: ')
+for line in response_text.strip().split('\n'):
+    if line.startswith('data: '):
+        json_str = line[6:]  # Remove 'data: ' prefix
+        data = json.loads(json_str)
+```
+
+See `tests/test_client_remote_iam.py` for a complete working example with proper error handling.
 
 ## Authentication Setup
 
