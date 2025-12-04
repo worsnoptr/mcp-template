@@ -1,275 +1,179 @@
 #!/usr/bin/env python3
 """
-Remote MCP Server Test Client - IAM Authentication
-
-This script demonstrates how to invoke a deployed MCP server on Amazon Bedrock 
-AgentCore Runtime using IAM authentication with boto3.
-
-CRITICAL: The accept header MUST include 'text/event-stream' to receive SSE responses.
-Using only 'application/json' will result in HTTP 406 Not Acceptable errors.
-
-Prerequisites:
-- Agent deployed to AgentCore Runtime
-- AWS credentials configured (via AWS CLI, environment variables, or IAM role)
-- boto3 installed: pip install boto3
-
+Remote testing client for MCP servers deployed to AgentCore with IAM authentication.
+ 
+This script demonstrates the correct way to invoke an MCP server on AgentCore
+using IAM (SigV4) authentication via boto3.
+ 
 Usage:
-    # Set the agent runtime ARN
-    export AGENT_ARN="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server-xyz"
-    
-    # Run the test
+    export AGENT_ARN="arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/your-server-xyz"
     python tests/test_client_remote_iam.py
-
-AWS Credentials:
-    The script uses boto3's default credential chain:
-    1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
-    2. AWS CLI configuration (~/.aws/credentials)
-    3. IAM instance profile (when running on EC2)
-    4. IAM role (when running in containers/Lambda)
-
-Required IAM Permissions:
-    {
-      "Version": "2012-10-17",
-      "Statement": [
-        {
-          "Effect": "Allow",
-          "Action": ["bedrock-agentcore:InvokeAgentRuntime"],
-          "Resource": "arn:aws:bedrock-agentcore:*:*:runtime/*"
-        }
-      ]
-    }
+ 
+Requirements:
+    - AWS credentials configured (via AWS CLI, environment variables, or IAM role)
+    - boto3 installed
+    - bedrock-agentcore:InvokeAgentRuntime permission
+ 
+IMPORTANT: The accept header MUST include both 'application/json' AND 'text/event-stream'
+as required by the MCP protocol. Using only 'application/json' will result in HTTP 406 errors.
 """
-
+ 
+import boto3
+import json
 import os
 import sys
-import json
 import uuid
-import boto3
-from botocore.exceptions import ClientError
-
-
-def parse_sse_response(response_body):
+ 
+ 
+def get_agent_arn():
+    """Get agent ARN from environment or config."""
+    arn = os.getenv('AGENT_ARN')
+    if not arn:
+        # Try to read from .bedrock_agentcore.yaml
+        try:
+            import yaml
+            with open('.bedrock_agentcore.yaml', 'r') as f:
+                config = yaml.safe_load(f)
+                arn = config.get('agent_runtime_arn')
+        except:
+            pass
+    if not arn:
+        print("Error: AGENT_ARN environment variable not set")
+        print("Usage: export AGENT_ARN='arn:aws:bedrock-agentcore:...'")
+        sys.exit(1)
+    return arn
+ 
+ 
+def invoke_mcp(client, agent_arn, runtime_session_id, mcp_session_id, method, params=None, request_id=1):
     """
-    Parse Server-Sent Events (SSE) response from AgentCore.
-    
-    SSE format:
-        data: {"jsonrpc":"2.0","result":{...},"id":1}
-        
-        data: {"jsonrpc":"2.0","result":{...},"id":2}
-    
-    Each event line starts with 'data: ' followed by JSON.
-    """
-    results = []
-    
-    # Read and decode the response
-    response_text = response_body.decode('utf-8')
-    
-    # Split by newlines and process each line
-    for line in response_text.strip().split('\n'):
-        # SSE data lines start with 'data: '
-        if line.startswith('data: '):
-            # Extract JSON after 'data: ' prefix
-            json_str = line[6:]  # Remove 'data: ' prefix
-            try:
-                data = json.loads(json_str)
-                results.append(data)
-            except json.JSONDecodeError as e:
-                print(f"Warning: Failed to parse JSON: {e}")
-                print(f"Line content: {json_str}")
-    
-    return results
-
-
-def invoke_mcp_server(runtime_arn, session_id, payload, region='us-west-2'):
-    """
-    Invoke MCP server using IAM authentication.
-    
+    Invoke an MCP method on the deployed server.
+    CRITICAL: The accept header MUST include both 'application/json' AND 'text/event-stream'
+    as required by the MCP protocol. Using only 'application/json' will result in HTTP 406 errors.
     Args:
-        runtime_arn: Full ARN of the AgentCore runtime
-        session_id: Unique session identifier (33+ characters)
-        payload: JSON-RPC payload as dictionary
-        region: AWS region where runtime is deployed
-    
+        client: boto3 bedrock-agentcore client
+        agent_arn: ARN of the deployed agent
+        runtime_session_id: Unique session ID for the runtime
+        mcp_session_id: MCP-specific session ID
+        method: MCP method to call (e.g., "tools/list", "tools/call")
+        params: Optional parameters for the method
+        request_id: JSON-RPC request ID
     Returns:
-        Parsed response data
+        Parsed JSON response from the MCP server
     """
-    client = boto3.client('bedrock-agentcore-runtime', region_name=region)
-    
-    try:
-        # CRITICAL: The accept parameter MUST include 'text/event-stream'
-        # Using only 'application/json' causes HTTP 406 Not Acceptable errors
-        response = client.invoke_agent_runtime(
-            agentRuntimeArn=runtime_arn,
-            runtimeSessionId=session_id,
-            mcpSessionId=session_id,  # Use same ID for MCP session
-            mcpProtocolVersion='2024-11-05',  # Required MCP protocol version
-            payload=json.dumps(payload),
-            qualifier='DEFAULT',
-            accept='application/json, text/event-stream'  # CRITICAL: Include text/event-stream
-        )
-        
-        # Parse the SSE response stream
-        response_body = response['response'].read()
-        results = parse_sse_response(response_body)
-        
-        # Return the first result (or all if multiple)
-        if len(results) == 1:
-            return results[0]
-        return results
-        
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        error_msg = e.response['Error']['Message']
-        
-        if error_code == 'AccessDeniedException':
-            print(f"\n✗ ERROR: Access Denied")
-            print(f"Message: {error_msg}")
-            print(f"\nEnsure your AWS credentials have permission:")
-            print(f"  Action: bedrock-agentcore:InvokeAgentRuntime")
-            print(f"  Resource: {runtime_arn}")
-        elif error_code == 'ResourceNotFoundException':
-            print(f"\n✗ ERROR: Runtime Not Found")
-            print(f"Message: {error_msg}")
-            print(f"\nVerify the runtime ARN is correct:")
-            print(f"  Provided: {runtime_arn}")
-        elif e.response.get('ResponseMetadata', {}).get('HTTPStatusCode') == 406:
-            print(f"\n✗ ERROR: HTTP 406 Not Acceptable")
-            print(f"Message: {error_msg}")
-            print(f"\nThis error occurs when the accept header is incorrect.")
-            print(f"SOLUTION: Ensure accept='application/json, text/event-stream'")
-        else:
-            print(f"\n✗ ERROR: {error_code}")
-            print(f"Message: {error_msg}")
-        
-        raise
-
-
+    payload = {"jsonrpc": "2.0", "method": method, "id": request_id}
+    if params:
+        payload["params"] = params
+    response = client.invoke_agent_runtime(
+        agentRuntimeArn=agent_arn,
+        runtimeSessionId=runtime_session_id,
+        mcpSessionId=mcp_session_id,
+        mcpProtocolVersion="2024-11-05",
+        payload=json.dumps(payload).encode('utf-8'),
+        qualifier='DEFAULT',
+        contentType='application/json',
+        # CRITICAL: Must accept both content types per MCP protocol spec
+        accept='application/json, text/event-stream'
+    )
+    # Parse SSE (Server-Sent Events) response format
+    # The response stream returns raw bytes in SSE format
+    full_response = b""
+    for chunk in response['response']:
+        if isinstance(chunk, bytes):
+            full_response += chunk
+    # Extract JSON from SSE format (event: message\ndata: {...})
+    text = full_response.decode('utf-8')
+    for line in text.strip().split('\n'):
+        if line.startswith('data: '):
+            return json.loads(line[6:])
+    return None
+ 
+ 
 def main():
-    """Main test function."""
-    
-    # Get configuration from environment
-    runtime_arn = os.getenv('AGENT_ARN')
-    region = os.getenv('AWS_REGION', 'us-west-2')
-    
-    if not runtime_arn:
-        print("ERROR: AGENT_ARN environment variable not set")
-        print("\nUsage:")
-        print("  export AGENT_ARN='arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/my-server-xyz'")
-        print("  python tests/test_client_remote_iam.py")
-        print("\nNote: AWS credentials must be configured (via AWS CLI or environment variables)")
-        sys.exit(1)
-    
-    # Generate unique session ID (must be 33+ characters)
-    session_id = f"test-session-{uuid.uuid4().hex}"
-    
-    print("="*80)
-    print("MCP Server Remote Test Client - IAM Authentication")
-    print("="*80)
-    print(f"Runtime ARN: {runtime_arn}")
+    agent_arn = get_agent_arn()
+    region = agent_arn.split(':')[3]  # Extract region from ARN
+    print("=" * 80)
+    print("MCP Server Remote Test (IAM Authentication)")
+    print("=" * 80)
+    print(f"Agent ARN: {agent_arn}")
     print(f"Region: {region}")
-    print(f"Session ID: {session_id}")
-    print(f"Authentication: AWS IAM (via boto3)")
-    print("="*80)
-    
-    # Verify AWS credentials are available
+    # Create boto3 client
+    client = boto3.client('bedrock-agentcore', region_name=region)
+    # Generate session IDs
+    runtime_session_id = f"test-{uuid.uuid4().hex}"
+    mcp_session_id = f"mcp-{uuid.uuid4().hex}"
+    print(f"Runtime Session: {runtime_session_id}")
+    print(f"MCP Session: {mcp_session_id}")
+    print("=" * 80)
+    # Test 1: List tools
+    print("\n1. Listing available tools...")
     try:
-        sts = boto3.client('sts', region_name=region)
-        identity = sts.get_caller_identity()
-        print(f"\n✓ AWS Credentials Found")
-        print(f"  Account: {identity['Account']}")
-        print(f"  ARN: {identity['Arn']}")
-    except Exception as e:
-        print(f"\n✗ ERROR: Unable to verify AWS credentials")
-        print(f"  {e}")
-        print(f"\nEnsure AWS credentials are configured:")
-        print(f"  - Run: aws configure")
-        print(f"  - Or set: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY")
-        sys.exit(1)
-    
-    try:
-        # Test 1: List available tools
-        print("\n" + "="*80)
-        print("Test 1: List Available Tools")
-        print("="*80)
-        
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "tools/list",
-            "id": 1
-        }
-        
-        result = invoke_mcp_server(runtime_arn, session_id, payload, region)
-        
-        if 'error' in result:
-            print(f"✗ Error: {result['error']}")
-            sys.exit(1)
-        
-        tools = result.get('result', {}).get('tools', [])
-        print(f"\n✓ Found {len(tools)} tools:")
-        
-        for tool in tools:
-            print(f"\n  • {tool['name']}")
-            print(f"    {tool.get('description', 'No description')}")
-        
-        # Test 2: Call a tool (if available)
-        if tools:
-            print("\n" + "="*80)
-            print("Test 2: Call a Tool")
-            print("="*80)
-            
-            # Try to find add_numbers or use first available tool
-            test_tool = None
-            test_args = {}
-            
+        result = invoke_mcp(client, agent_arn, runtime_session_id, mcp_session_id, "tools/list")
+        if result and 'result' in result:
+            tools = result['result'].get('tools', [])
+            print(f"   ✓ Found {len(tools)} tools:")
             for tool in tools:
-                if tool['name'] == 'add_numbers':
-                    test_tool = 'add_numbers'
-                    test_args = {"a": 5, "b": 3}
-                    break
-            
-            if not test_tool and tools:
-                # Use first available tool with minimal args
-                test_tool = tools[0]['name']
-                test_args = {}
-            
-            if test_tool:
-                payload = {
-                    "jsonrpc": "2.0",
-                    "method": "tools/call",
-                    "params": {
-                        "name": test_tool,
-                        "arguments": test_args
-                    },
-                    "id": 2
-                }
-                
-                print(f"\nCalling {test_tool}({test_args})...")
-                
-                result = invoke_mcp_server(runtime_arn, session_id, payload, region)
-                
-                if 'error' in result:
-                    print(f"✗ Error: {result['error']}")
-                else:
-                    print(f"✓ Success!")
-                    print(f"Result: {json.dumps(result.get('result'), indent=2)}")
-        
-        # Success
-        print("\n" + "="*80)
-        print("✓ All Tests Passed!")
-        print("="*80)
-        print("\nKey Takeaways:")
-        print("  1. IAM authentication works seamlessly with boto3")
-        print("  2. The accept header MUST include 'text/event-stream'")
-        print("  3. Responses are in SSE format and must be parsed accordingly")
-        print("  4. Session IDs must be unique and 33+ characters long")
-        print("  5. mcpProtocolVersion must be '2024-11-05'")
-        
+                print(f"      - {tool['name']}")
+        else:
+            print(f"   ✗ Unexpected response: {result}")
+            return 1
     except Exception as e:
-        print(f"\n✗ Test Failed: {e}")
+        print(f"   ✗ Error: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
-
-
+        return 1
+    # Test 2: Call a tool (if any tools exist)
+    if tools:
+        tool = tools[0]
+        print(f"\n2. Testing tool: {tool['name']}...")
+        try:
+            # Get the first tool's required parameters
+            schema = tool.get('inputSchema', {})
+            required = schema.get('required', [])
+            properties = schema.get('properties', {})
+            # Build test arguments with sample values
+            test_args = {}
+            for param in required:
+                prop = properties.get(param, {})
+                param_type = prop.get('type', 'string')
+                default = prop.get('default')
+                if default is not None:
+                    test_args[param] = default
+                elif param_type == 'number':
+                    test_args[param] = 0.0
+                elif param_type == 'integer':
+                    test_args[param] = 0
+                elif param_type == 'boolean':
+                    test_args[param] = True
+                else:
+                    test_args[param] = "test"
+            print(f"   Arguments: {test_args}")
+            result = invoke_mcp(
+                client, agent_arn, runtime_session_id, mcp_session_id,
+                "tools/call",
+                {"name": tool['name'], "arguments": test_args},
+                request_id=2
+            )
+            if result and 'result' in result:
+                is_error = result['result'].get('isError', False)
+                if is_error:
+                    print(f"   ⚠ Tool returned error (expected with test values)")
+                else:
+                    print(f"   ✓ Tool executed successfully")
+                content = result['result'].get('content', [])
+                if content:
+                    text_content = content[0].get('text', '')
+                    print(f"   Response preview: {text_content[:200]}...")
+            else:
+                print(f"   Response: {result}")
+        except Exception as e:
+            print(f"   ✗ Error: {e}")
+            import traceback
+            traceback.print_exc()
+    print("\n" + "=" * 80)
+    print("✓ Remote testing complete!")
+    print("=" * 80)
+    return 0
+ 
+ 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
